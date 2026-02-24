@@ -36,9 +36,13 @@
 #include "PCCTMC3Encoder.h"
 
 #include <cassert>
+#include <atomic>
+#include <exception>
 #include <limits>
+#include <mutex>
 #include <set>
 #include <stdexcept>
+#include <thread>
 #include <numeric>
 
 #include "Attribute.h"
@@ -499,6 +503,33 @@ PCCTMC3Encoder3::compress(
     std::cout << "Slice number: " << partitions.slices.size() << std::endl;
   } while (0);
 
+  std::vector<std::vector<const Partition*>> tileToSlices(tileMaps.size());
+  for (int t = 0; t < tileMaps.size(); t++) {
+    auto tile_id = partitions.tileInventory.tiles.empty()
+      ? 0
+      : partitions.tileInventory.tiles[t].tile_id;
+
+    for (const auto& partition : partitions.slices) {
+      if (partition.tileId == tile_id)
+        tileToSlices[t].push_back(&partition);
+    }
+  }
+
+  const bool canThreadTiles =
+    params->partition.tileSize > 0
+    && tileMaps.size() > 1
+    && !params->gps.predgeom_enabled_flag
+    && !params->gps.trisoup_enabled_flag
+    && !params->gps.interPredictionEnabledFlag
+    && !params->sps.inter_frame_prediction_enabled_flag
+    && !params->gps.biPredictionEnabledFlag
+    && !params->sps.entropy_continuation_enabled_flag
+    && !params->sps.inter_entropy_continuation_enabled_flag;
+
+  if (canThreadTiles) {
+    std::cout << "Tile threading enabled\n";
+  }
+
   if (_frameCounter) {
     if (params->gps.predgeom_enabled_flag) {
       if (params->gps.biPredictionEnabledFlag){
@@ -541,33 +572,179 @@ PCCTMC3Encoder3::compress(
   //  - create a pointset comprising just the partitioned points
   //  - compress
   pcc::CloudFrame reconCloudAlt;
+  struct BufferedEvent {
+    enum class Type
+    {
+      kPayload,
+      kRecolour
+    };
 
-  for (const auto& partition : partitions.slices) {
-    // create partitioned point set
-    PCCPointSet3 sliceCloud =
-      getPartition(quantizedInput.cloud, partition.pointIndexes);
+    Type type;
+    size_t index;
+  };
 
-    PCCPointSet3 sliceCloudPadding;
-    if (!params->trisoupNodeSizesLog2.empty()) {
-      sliceCloudPadding =
-        getPartition(quantizedInput.cloud, partition.pointIndexesPadding);
+  struct BufferedCallbacks : PCCTMC3Encoder3::Callbacks {
+    std::vector<BufferedEvent> events;
+    std::vector<PayloadBuffer> payloads;
+    std::vector<PCCPointSet3> recolourClouds;
 
-      PCCPointSet3 sliceCloudPadding2 =
-        getPartition(quantizedInput.cloud, partition.pointIndexesPadding2);
-
-      sliceCloudPadding.append(sliceCloudPadding2);
+    void onOutputBuffer(const PayloadBuffer& buf) override
+    {
+      events.push_back({BufferedEvent::Type::kPayload, payloads.size()});
+      payloads.push_back(buf);
     }
 
-    PCCPointSet3 sliceSrcCloud =
-      getPartition(inputPointCloud, quantizedInput, partition.pointIndexes);
+    void onPostRecolour(const PCCPointSet3& cloud) override
+    {
+      events.push_back({BufferedEvent::Type::kRecolour, recolourClouds.size()});
+      recolourClouds.push_back(cloud);
+    }
+  };
 
-    _sliceId = partition.sliceId;
-    _tileId = partition.tileId;
-    _sliceOrigin = sliceCloud.computeBoundingBox().min;
+  struct TileTaskResult {
+    BufferedCallbacks callbacks;
+    CloudFrame recon;
+    CloudFrame reconAlt;
+  };
 
-    compressPartition(
-      sliceCloud, sliceSrcCloud, sliceCloudPadding, params, callback,
-      reconCloud, &reconCloudAlt);
+  if (!canThreadTiles) {
+    for (const auto& partition : partitions.slices) {
+      // create partitioned point set
+      PCCPointSet3 sliceCloud =
+        getPartition(quantizedInput.cloud, partition.pointIndexes);
+
+      PCCPointSet3 sliceCloudPadding;
+      if (!params->trisoupNodeSizesLog2.empty()) {
+        sliceCloudPadding =
+          getPartition(quantizedInput.cloud, partition.pointIndexesPadding);
+
+        PCCPointSet3 sliceCloudPadding2 =
+          getPartition(quantizedInput.cloud, partition.pointIndexesPadding2);
+
+        sliceCloudPadding.append(sliceCloudPadding2);
+      }
+
+      PCCPointSet3 sliceSrcCloud =
+        getPartition(inputPointCloud, quantizedInput, partition.pointIndexes);
+
+      _sliceId = partition.sliceId;
+      _tileId = partition.tileId;
+      _sliceOrigin = sliceCloud.computeBoundingBox().min;
+
+      compressPartition(
+        sliceCloud, sliceSrcCloud, sliceCloudPadding, params, callback,
+        reconCloud, &reconCloudAlt);
+    }
+  } else {
+    const int tileCount = int(tileMaps.size());
+    const auto hwThreads = std::max(1u, std::thread::hardware_concurrency());
+    const size_t numWorkers =
+      std::min<size_t>(size_t(tileCount), size_t(hwThreads));
+
+    std::vector<TileTaskResult> tileResults(tileCount);
+    std::atomic<int> nextTile{0};
+    std::atomic<bool> hasError{false};
+    std::exception_ptr firstErr;
+    std::mutex errMutex;
+
+    // start a timer here
+    std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
+
+    auto worker = [&]() {
+      while (true) {
+        if (hasError.load())
+          return;
+
+        int tileIndex = nextTile.fetch_add(1);
+        if (tileIndex >= tileCount)
+          return;
+
+        try {
+          auto& result = tileResults[tileIndex];
+
+          EncoderParams paramsLocal = *params;
+          PCCTMC3Encoder3 tileEnc;
+
+          tileEnc._sps = &paramsLocal.sps;
+          tileEnc._gps = &paramsLocal.gps;
+          tileEnc._aps.clear();
+          for (const auto& aps : paramsLocal.aps)
+            tileEnc._aps.push_back(&aps);
+
+          tileEnc._srcToCodingScale = _srcToCodingScale;
+          tileEnc._originInCodingCoords = _originInCodingCoords;
+          tileEnc._frameCounter = _frameCounter;
+          tileEnc._codeCurrFrameAsInter = false;
+          tileEnc._firstSliceInFrame = true;
+          tileEnc._prevSliceId = 0;
+          tileEnc._ctxtMemAttrs.resize(paramsLocal.sps.attributeSets.size());
+
+          for (const auto* partition : tileToSlices[tileIndex]) {
+            PCCPointSet3 sliceCloud =
+              getPartition(quantizedInput.cloud, partition->pointIndexes);
+
+            PCCPointSet3 sliceCloudPadding;
+            if (!paramsLocal.trisoupNodeSizesLog2.empty()) {
+              sliceCloudPadding = getPartition(
+                quantizedInput.cloud, partition->pointIndexesPadding);
+
+              PCCPointSet3 sliceCloudPadding2 = getPartition(
+                quantizedInput.cloud, partition->pointIndexesPadding2);
+
+              sliceCloudPadding.append(sliceCloudPadding2);
+            }
+
+            PCCPointSet3 sliceSrcCloud = getPartition(
+              inputPointCloud, quantizedInput, partition->pointIndexes);
+
+            tileEnc._sliceId = partition->sliceId;
+            tileEnc._tileId = partition->tileId;
+            tileEnc._sliceOrigin = sliceCloud.computeBoundingBox().min;
+
+            tileEnc.compressPartition(
+              sliceCloud, sliceSrcCloud, sliceCloudPadding, &paramsLocal,
+              &result.callbacks, reconCloud ? &result.recon : nullptr,
+              reconCloud ? &result.reconAlt : nullptr);
+          }
+        } catch (...) {
+          if (!hasError.exchange(true)) {
+            std::lock_guard<std::mutex> lock(errMutex);
+            firstErr = std::current_exception();
+          }
+          return;
+        }
+      }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(numWorkers);
+    for (size_t i = 0; i < numWorkers; i++)
+      workers.emplace_back(worker);
+
+    for (auto& workerThread : workers)
+      workerThread.join();
+
+    if (firstErr)
+      std::rethrow_exception(firstErr);
+
+    std::chrono::steady_clock::time_point endTime = std::chrono::steady_clock::now();
+    std::chrono::duration<double> elapsedSeconds = endTime - startTime;
+    std::cout << "Tile encoding took " << elapsedSeconds.count() << " seconds\n";
+
+    for (int tileIndex = 0; tileIndex < tileCount; tileIndex++) {
+      auto& result = tileResults[tileIndex];
+      for (const auto& event : result.callbacks.events) {
+        if (event.type == BufferedEvent::Type::kPayload)
+          callback->onOutputBuffer(result.callbacks.payloads[event.index]);
+        else
+          callback->onPostRecolour(result.callbacks.recolourClouds[event.index]);
+      }
+
+      if (reconCloud) {
+        reconCloud->cloud.append(result.recon.cloud);
+        reconCloudAlt.cloud.append(result.reconAlt.cloud);
+      }
+    }
   }
 
   const PCCPointSet3 accurrentPointCloud =(reconCloud) ? reconCloud->cloud : PCCPointSet3{};
@@ -1007,13 +1184,13 @@ PCCTMC3Encoder3::compressPartition(
     clock_user.stop();
 
     double bpp = double(8 * payload.size()) / inputPointCloud.getPointCount();
-    std::cout << "positions bitstream size " << payload.size() << " B (" << bpp
-              << " bpp)\n";
+    // std::cout << "positions bitstream size " << payload.size() << " B (" << bpp
+    //           << " bpp)\n";
 
     auto total_user = std::chrono::duration_cast<std::chrono::milliseconds>(
       clock_user.count());
-    std::cout << "positions processing time (user): "
-              << total_user.count() / 1000.0 << " s" << std::endl;
+    // std::cout << "positions processing time (user): "
+    //           << total_user.count() / 1000.0 << " s" << std::endl;
 
     callback->onOutputBuffer(payload);
   }
@@ -1261,14 +1438,14 @@ PCCTMC3Encoder3::compressPartition(
 
     int coded_size = int(payload.size());
     double bpp = double(8 * coded_size) / inputPointCloud.getPointCount();
-    std::cout << label << "s bitstream size " << coded_size << " B (" << bpp
-              << " bpp)\n";
+    // std::cout << label << "s bitstream size " << coded_size << " B (" << bpp
+    //           << " bpp)\n";
 
     auto time_user = std::chrono::duration_cast<std::chrono::milliseconds>(
       clock_user.count());
-    std::cout << label
-              << "s processing time (user): " << time_user.count() / 1000.0
-              << " s" << std::endl;
+    // std::cout << label
+    //           << "s processing time (user): " << time_user.count() / 1000.0
+    //           << " s" << std::endl;
 
     callback->onOutputBuffer(payload);
   }

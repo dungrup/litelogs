@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.0)
 enable_language(C)
+find_package(Threads REQUIRED)
 
 if (UNIX)
   add_definitions(-D_POSIX_C_SOURCE=200809L)
@@ -169,6 +170,7 @@ add_executable (tmc3
   ${PROJECT_IN_FILES}
   ${VERSION_FILE}
 )
+target_link_libraries(tmc3 PRIVATE Threads::Threads)
 add_dependencies(tmc3 genversion)
 
 add_executable (ply-merge EXCLUDE_FROM_ALL
