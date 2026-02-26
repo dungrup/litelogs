@@ -1,4 +1,4 @@
-# TMC13
+# LiteLogs: A fork of TMC13
 
 ## Building
 
@@ -9,10 +9,13 @@
 - open the generated xcode project and build it
 
 ### Linux
-- mkdir build
-- cd build
-- cmake .. 
-- make
+
+```
+> mkdir build
+> cd build
+> cmake .. 
+> make
+```
 
 ### Windows
 - md build
@@ -23,10 +26,26 @@
 
 ## Running
 
+**UPDATE:** LiteLogs is an encoder only implementation of TMC13 with tile-level and frame-level multithreading enabled. You can find the "litelogs" binary alongside the TMC13 binary in "./build/tmc3/"
+
+To run litelogs:
+
+1. Point to correct paths in LiteLogs.cpp (L230-232)
+2. Re-build using above instructions
+3. Litelogs will compress all files in __dataPath__ to __compressedPath__. Find timing stats in __csvPath__
+
+```
+> ./build/tmc3/litelogs -c encoder_fast.cfg
+```
+
+Tune necessary params in __encoder_fast.cfg__
+
+
 This TMC13 codec implementation encodes frame sequences.  A single binary
 contains the encoder and decoder implementation, with selection using
 the `--mode` option.  Documentation of options is provided via the
 `--help` command line option.
+
 
 ### Runtime configuration and configuration files
 
