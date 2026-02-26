@@ -217,6 +217,7 @@ public:
   int getCodeOrder(int x) { return hGOFEncodeParams.codeOrderList[x]; }
   int getRefFrame(int x) { return hGOFEncodeParams.refFrameList[x]; }
   int getQPshift(int x) { return hGOFEncodeParams.attrQPShiftList[x]; }
+  double getLastTileEncodingMs() const { return _lastTileEncodingMs; }
 
   bool biPredictionEligibility(
     const int curPicIndex, const int prePicIndex, EncoderParams* params);
@@ -303,6 +304,7 @@ private:
 
   BiPredictionEncodeParams biPredEncodeParams;
   HierarchicalGOFParams hGOFEncodeParams;
+  double _lastTileEncodingMs = -1.0;
 
 };
 

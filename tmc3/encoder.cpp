@@ -45,6 +45,9 @@
 #include <thread>
 #include <numeric>
 
+#include <sys/time.h>
+#include <time.h>
+
 #include "Attribute.h"
 #include "AttributeCommon.h"
 #include "coordinate_conversion.h"
@@ -86,6 +89,15 @@ PCCTMC3Encoder3::~PCCTMC3Encoder3() = default;
 
 //============================================================================
 
+// Custom timing cause I don't trust chrono
+
+typedef struct timing_vals
+{
+  struct timeval start;
+  struct timeval end;
+} timing;
+
+
 int
 PCCTMC3Encoder3::compress(
   const PCCPointSet3& inputPointCloud,
@@ -93,6 +105,8 @@ PCCTMC3Encoder3::compress(
   PCCTMC3Encoder3::Callbacks* callback,
   CloudFrame* reconCloud)
 {
+  _lastTileEncodingMs = -1.0;
+
   // start of frame
   if (params->gps.biPredictionEnabledFlag)
     _frameCounter = biPredEncodeParams.currentFrameIndex;
@@ -388,7 +402,7 @@ PCCTMC3Encoder3::compress(
   if (partitions.tileInventory.tiles.size() > 1) {
     auto& inventory = partitions.tileInventory;
     assert(inventory.tiles.size() == tileMaps.size());
-    std::cout << "Tile number: " << tileMaps.size() << std::endl;
+    // std::cout << "Tile number: " << tileMaps.size() << std::endl;
     inventory.ti_seq_parameter_set_id = _sps->sps_seq_parameter_set_id;
     inventory.ti_origin_bits_minus1 =
       numBits(inventory.origin.abs().max()) - 1;
@@ -500,7 +514,7 @@ PCCTMC3Encoder3::compress(
       partitions.slices.insert(
         partitions.slices.end(), curSlices.begin(), curSlices.end());
     }
-    std::cout << "Slice number: " << partitions.slices.size() << std::endl;
+    // std::cout << "Slice number: " << partitions.slices.size() << std::endl;
   } while (0);
 
   std::vector<std::vector<const Partition*>> tileToSlices(tileMaps.size());
@@ -526,9 +540,9 @@ PCCTMC3Encoder3::compress(
     && !params->sps.entropy_continuation_enabled_flag
     && !params->sps.inter_entropy_continuation_enabled_flag;
 
-  if (canThreadTiles) {
-    std::cout << "Tile threading enabled\n";
-  }
+  // if (canThreadTiles) {
+  //   std::cout << "Tile threading enabled\n";
+  // }
 
   if (_frameCounter) {
     if (params->gps.predgeom_enabled_flag) {
@@ -607,6 +621,12 @@ PCCTMC3Encoder3::compress(
     CloudFrame reconAlt;
   };
 
+  struct SliceTaskResult {
+    BufferedCallbacks callbacks;
+    CloudFrame recon;
+    CloudFrame reconAlt;
+  };
+
   if (!canThreadTiles) {
     for (const auto& partition : partitions.slices) {
       // create partitioned point set
@@ -637,9 +657,12 @@ PCCTMC3Encoder3::compress(
     }
   } else {
     const int tileCount = int(tileMaps.size());
-    const auto hwThreads = std::max(1u, std::thread::hardware_concurrency());
+    // const auto hwThreads = std::max(1u, std::thread::hardware_concurrency());
+    const auto hwThreads = 8;
     const size_t numWorkers =
       std::min<size_t>(size_t(tileCount), size_t(hwThreads));
+
+    // printf("Using %zu worker threads for tile encoding\n", numWorkers);
 
     std::vector<TileTaskResult> tileResults(tileCount);
     std::atomic<int> nextTile{0};
@@ -648,7 +671,9 @@ PCCTMC3Encoder3::compress(
     std::mutex errMutex;
 
     // start a timer here
-    std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
+    // std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
+    timing tile_time;
+    gettimeofday(&tile_time.start, NULL);
 
     auto worker = [&]() {
       while (true) {
@@ -663,28 +688,34 @@ PCCTMC3Encoder3::compress(
           auto& result = tileResults[tileIndex];
 
           EncoderParams paramsLocal = *params;
-          PCCTMC3Encoder3 tileEnc;
+          const auto& tileSlices = tileToSlices[tileIndex];
+          std::vector<SliceTaskResult> sliceResults(tileSlices.size());
 
-          tileEnc._sps = &paramsLocal.sps;
-          tileEnc._gps = &paramsLocal.gps;
-          tileEnc._aps.clear();
-          for (const auto& aps : paramsLocal.aps)
-            tileEnc._aps.push_back(&aps);
+          auto runSlice = [&](int sliceIdx) {
+            const auto* partition = tileSlices[sliceIdx];
 
-          tileEnc._srcToCodingScale = _srcToCodingScale;
-          tileEnc._originInCodingCoords = _originInCodingCoords;
-          tileEnc._frameCounter = _frameCounter;
-          tileEnc._codeCurrFrameAsInter = false;
-          tileEnc._firstSliceInFrame = true;
-          tileEnc._prevSliceId = 0;
-          tileEnc._ctxtMemAttrs.resize(paramsLocal.sps.attributeSets.size());
+            EncoderParams paramsSlice = paramsLocal;
+            PCCTMC3Encoder3 sliceEnc;
 
-          for (const auto* partition : tileToSlices[tileIndex]) {
+            sliceEnc._sps = &paramsSlice.sps;
+            sliceEnc._gps = &paramsSlice.gps;
+            sliceEnc._aps.clear();
+            for (const auto& aps : paramsSlice.aps)
+              sliceEnc._aps.push_back(&aps);
+
+            sliceEnc._srcToCodingScale = _srcToCodingScale;
+            sliceEnc._originInCodingCoords = _originInCodingCoords;
+            sliceEnc._frameCounter = _frameCounter;
+            sliceEnc._codeCurrFrameAsInter = false;
+            sliceEnc._firstSliceInFrame = true;
+            sliceEnc._prevSliceId = 0;
+            sliceEnc._ctxtMemAttrs.resize(paramsSlice.sps.attributeSets.size());
+
             PCCPointSet3 sliceCloud =
               getPartition(quantizedInput.cloud, partition->pointIndexes);
 
             PCCPointSet3 sliceCloudPadding;
-            if (!paramsLocal.trisoupNodeSizesLog2.empty()) {
+            if (!paramsSlice.trisoupNodeSizesLog2.empty()) {
               sliceCloudPadding = getPartition(
                 quantizedInput.cloud, partition->pointIndexesPadding);
 
@@ -697,14 +728,91 @@ PCCTMC3Encoder3::compress(
             PCCPointSet3 sliceSrcCloud = getPartition(
               inputPointCloud, quantizedInput, partition->pointIndexes);
 
-            tileEnc._sliceId = partition->sliceId;
-            tileEnc._tileId = partition->tileId;
-            tileEnc._sliceOrigin = sliceCloud.computeBoundingBox().min;
+            sliceEnc._sliceId = partition->sliceId;
+            sliceEnc._tileId = partition->tileId;
+            sliceEnc._sliceOrigin = sliceCloud.computeBoundingBox().min;
 
-            tileEnc.compressPartition(
-              sliceCloud, sliceSrcCloud, sliceCloudPadding, &paramsLocal,
-              &result.callbacks, reconCloud ? &result.recon : nullptr,
-              reconCloud ? &result.reconAlt : nullptr);
+            auto& sliceResult = sliceResults[sliceIdx];
+            sliceEnc.compressPartition(
+              sliceCloud, sliceSrcCloud, sliceCloudPadding, &paramsSlice,
+              &sliceResult.callbacks, reconCloud ? &sliceResult.recon : nullptr,
+              reconCloud ? &sliceResult.reconAlt : nullptr);
+          };
+
+          if (tileSlices.size() <= 1) {
+            if (!tileSlices.empty())
+              runSlice(0);
+          } else {
+            constexpr size_t kMaxSliceWorkers = 8;
+            const size_t numSliceWorkers =
+              std::min<size_t>(tileSlices.size(), kMaxSliceWorkers);
+
+            std::atomic<int> nextSlice{0};
+            std::atomic<bool> hasSliceError{false};
+            std::exception_ptr firstSliceErr;
+            std::mutex sliceErrMutex;
+
+            auto sliceWorker = [&]() {
+              while (true) {
+                if (hasSliceError.load())
+                  return;
+
+                int sliceIdx = nextSlice.fetch_add(1);
+                if (sliceIdx >= tileSlices.size())
+                  return;
+
+                try {
+                  runSlice(sliceIdx);
+                } catch (...) {
+                  if (!hasSliceError.exchange(true)) {
+                    std::lock_guard<std::mutex> lock(sliceErrMutex);
+                    firstSliceErr = std::current_exception();
+                  }
+                  return;
+                }
+              }
+            };
+
+            std::vector<std::thread> sliceWorkers;
+            sliceWorkers.reserve(numSliceWorkers);
+            for (size_t i = 0; i < numSliceWorkers; i++)
+              sliceWorkers.emplace_back(sliceWorker);
+
+            for (auto& sliceWorkerThread : sliceWorkers)
+              sliceWorkerThread.join();
+
+            if (firstSliceErr)
+              std::rethrow_exception(firstSliceErr);
+          }
+
+          auto appendCallbacks =
+            [&](BufferedCallbacks& dst, BufferedCallbacks& src) {
+              const size_t payloadOffset = dst.payloads.size();
+              const size_t recolourOffset = dst.recolourClouds.size();
+
+              dst.payloads.insert(
+                dst.payloads.end(), src.payloads.begin(), src.payloads.end());
+              dst.recolourClouds.insert(
+                dst.recolourClouds.end(),
+                src.recolourClouds.begin(),
+                src.recolourClouds.end());
+
+              for (const auto& event : src.events) {
+                auto mappedEvent = event;
+                mappedEvent.index +=
+                  (event.type == BufferedEvent::Type::kPayload)
+                  ? payloadOffset
+                  : recolourOffset;
+                dst.events.push_back(mappedEvent);
+              }
+            };
+
+          for (auto& sliceResult : sliceResults) {
+            appendCallbacks(result.callbacks, sliceResult.callbacks);
+            if (reconCloud) {
+              result.recon.cloud.append(sliceResult.recon.cloud);
+              result.reconAlt.cloud.append(sliceResult.reconAlt.cloud);
+            }
           }
         } catch (...) {
           if (!hasError.exchange(true)) {
@@ -727,9 +835,13 @@ PCCTMC3Encoder3::compress(
     if (firstErr)
       std::rethrow_exception(firstErr);
 
-    std::chrono::steady_clock::time_point endTime = std::chrono::steady_clock::now();
-    std::chrono::duration<double> elapsedSeconds = endTime - startTime;
-    std::cout << "Tile encoding took " << elapsedSeconds.count() << " seconds\n";
+    // std::chrono::steady_clock::time_point endTime = std::chrono::steady_clock::now();
+    gettimeofday(&tile_time.end, NULL);
+    double elapsedTime = (tile_time.end.tv_sec - tile_time.start.tv_sec)*1000.0;
+    elapsedTime += (tile_time.end.tv_usec - tile_time.start.tv_usec) / 1000.0;
+    _lastTileEncodingMs = elapsedTime;
+
+    // std::cout << "Tile encoding took " << elapsedTime << " ms\n";
 
     for (int tileIndex = 0; tileIndex < tileCount; tileIndex++) {
       auto& result = tileResults[tileIndex];

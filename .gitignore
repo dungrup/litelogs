@@ -51,3 +51,4 @@ CMakeCache.txt
 *.cmake
 .idea
 DerivedData
+test_folder

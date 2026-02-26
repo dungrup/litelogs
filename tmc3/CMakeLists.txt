@@ -121,7 +121,6 @@ file(GLOB PROJECT_CPP_FILES
   "FixedPoint.cpp"
   "OctreeNeighMap.cpp"
   "RAHT.cpp"
-  "TMC3.cpp"
   "attribute_raw_decoder.cpp"
   "attribute_raw_encoder.cpp"
   "coordinate_conversion.cpp"
@@ -164,14 +163,26 @@ include_directories(
   "${CMAKE_CURRENT_SOURCE_DIR}/../dependencies/program-options-lite"
 )
 
-add_executable (tmc3
+set(PROJECT_COMMON_FILES
   ${PROJECT_CPP_FILES}
   ${PROJECT_INC_FILES}
   ${PROJECT_IN_FILES}
   ${VERSION_FILE}
 )
+
+add_executable (tmc3
+  ${PROJECT_COMMON_FILES}
+  "TMC3.cpp"
+)
 target_link_libraries(tmc3 PRIVATE Threads::Threads)
 add_dependencies(tmc3 genversion)
+
+add_executable (litelogs
+  ${PROJECT_COMMON_FILES}
+  "LiteLogs.cpp"
+)
+target_link_libraries(litelogs PRIVATE Threads::Threads)
+add_dependencies(litelogs genversion)
 
 add_executable (ply-merge EXCLUDE_FROM_ALL
   "../tools/ply-merge.cpp"
@@ -183,3 +194,4 @@ add_executable (ply-merge EXCLUDE_FROM_ALL
 add_dependencies(ply-merge genversion)
 
 install (TARGETS tmc3 DESTINATION bin)
+install (TARGETS litelogs DESTINATION bin)
