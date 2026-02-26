@@ -227,9 +227,9 @@ int
 main(int argc, char* argv[])
 {
   cout << "MPEG PCC litelogs version " << ::pcc::version << endl;
-  const fs::path dataPath = "/home/dungrup/litelogs/test_folder/orig_ply_files/";
-  const fs::path compressedPath = "/home/dungrup/litelogs/test_folder/compressed/";
-  const fs::path csvPath = "/home/dungrup/litelogs/litelogs_encoding_times.csv";
+  const fs::path dataPath = "/home/dungrup/wd_black/litelogs/test_folder/orig_ply_files/";
+  const fs::path compressedPath = "/home/dungrup/wd_black/litelogs/test_folder/compressed/";
+  const fs::path csvPath = "/home/dungrup/wd_black/litelogs/litelogs_encoding_times.csv";
 
   Parameters baseParams;
 
@@ -320,9 +320,7 @@ main(int argc, char* argv[])
 
     const std::string fileName = filePath.string();
     std::cout << "Compressing file: " << fileName << std::endl;
-    std::cout << "  firstFrameNum: " << runParams.firstFrameNum
-              << ", frameCount: " << runParams.frameCount << '\n'
-              << "  input: " << runParams.uncompressedDataPath << '\n'
+    std::cout << "  input: " << runParams.uncompressedDataPath << '\n'
               << "  output: " << runParams.compressedStreamPath << std::endl;
 
     SequenceEncoder sequenceEncoder(&runParams);
