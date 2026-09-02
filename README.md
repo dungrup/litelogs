@@ -26,7 +26,7 @@
 
 ## Running
 
-**UPDATE:** LiteLogs is an encoder only implementation of TMC13 with tile-level and frame-level multithreading enabled. You can find the "litelogs" binary alongside the TMC13 binary in "./build/tmc3/"
+**UPDATE:** LiteLogs is an encoder only implementation of TMC13 with tile-level and slice-level multithreading enabled. You can find the "litelogs" binary alongside the TMC13 binary in "./build/tmc3/"
 
 To run litelogs:
 

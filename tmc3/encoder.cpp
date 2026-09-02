@@ -344,6 +344,8 @@ PCCTMC3Encoder3::compress(
   //  - if not, regard the whole input cloud as a single tile to facilitate
   //    slice partitioning subsequent
   //  todo(df):
+  timing frame_time;
+  gettimeofday(&frame_time.start, NULL);
   PartitionSet partitions;
   SrcMappedPointSet quantizedInput = quantization(inputPointCloud);
 
@@ -402,7 +404,7 @@ PCCTMC3Encoder3::compress(
   if (partitions.tileInventory.tiles.size() > 1) {
     auto& inventory = partitions.tileInventory;
     assert(inventory.tiles.size() == tileMaps.size());
-    // std::cout << "Tile number: " << tileMaps.size() << std::endl;
+    // std::cout << "Tile count: " << tileMaps.size() << std::endl;
     inventory.ti_seq_parameter_set_id = _sps->sps_seq_parameter_set_id;
     inventory.ti_origin_bits_minus1 =
       numBits(inventory.origin.abs().max()) - 1;
@@ -510,6 +512,9 @@ PCCTMC3Encoder3::compress(
           }
         }
       }
+
+      for (auto& s : curSlices)
+        s.tileId = tile_id;
 
       partitions.slices.insert(
         partitions.slices.end(), curSlices.begin(), curSlices.end());
@@ -659,7 +664,7 @@ PCCTMC3Encoder3::compress(
     const int tileCount = int(tileMaps.size());
     // const auto hwThreads = std::max(1u, std::thread::hardware_concurrency());
     const auto hwThreads = 8;
-    const size_t numWorkers =
+    const size_t numWorkers = 
       std::min<size_t>(size_t(tileCount), size_t(hwThreads));
 
     // printf("Using %zu worker threads for tile encoding\n", numWorkers);
@@ -839,7 +844,6 @@ PCCTMC3Encoder3::compress(
     gettimeofday(&tile_time.end, NULL);
     double elapsedTime = (tile_time.end.tv_sec - tile_time.start.tv_sec)*1000.0;
     elapsedTime += (tile_time.end.tv_usec - tile_time.start.tv_usec) / 1000.0;
-    _lastTileEncodingMs = elapsedTime;
 
     // std::cout << "Tile encoding took " << elapsedTime << " ms\n";
 
@@ -858,6 +862,11 @@ PCCTMC3Encoder3::compress(
       }
     }
   }
+
+  gettimeofday(&frame_time.end, NULL);
+  double elapsedTime = (frame_time.end.tv_sec - frame_time.start.tv_sec)*1000.0;
+  elapsedTime += (frame_time.end.tv_usec - frame_time.start.tv_usec) / 1000.0;
+  _lastTileEncodingMs = elapsedTime;
 
   const PCCPointSet3 accurrentPointCloud =(reconCloud) ? reconCloud->cloud : PCCPointSet3{};
   if (_sps->inter_frame_prediction_enabled_flag) {

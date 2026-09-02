@@ -13,7 +13,7 @@ for src in "$BINDIR"/*.bin; do
   [ -e "$src" ] || continue
   base="$(basename "$src" .bin)"
   binfile="$src"                                 # input to decoder
-  dec_recon="$OUTDIR/recon_ply/${base}.ply"           # decoder output to keep
+  dec_recon="$OUTDIR/${base}.ply"           # decoder output to keep
 
   echo "Decoding $src -> $binfile"
   "$TMC3_BIN" --mode 1 \

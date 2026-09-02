@@ -36,7 +36,11 @@
 #include "TMC3.h"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
+#include <cmath>
 #include <memory>
+#include <sstream>
 #include <filesystem>
 
 #include "PCCTMC3Encoder.h"
@@ -52,6 +56,15 @@ namespace fs = std::filesystem;
 
 using namespace std;
 using namespace pcc;
+
+//============================================================================
+
+namespace pcc {
+// Defined in encoder.cpp.  Builds a sub-cloud from a list of point indexes,
+// carrying over whichever attributes the source cloud has.
+PCCPointSet3
+getPartition(const PCCPointSet3& src, const std::vector<int32_t>& indexes);
+}  // namespace pcc
 
 //============================================================================
 
@@ -101,6 +114,19 @@ struct Parameters {
   std::string uncompressedDataPath;
   std::string compressedStreamPath;
   std::string reconstructedDataPath;
+  
+  // *LiteLogs* specific parameters
+
+  // KITTI label/detection file describing the objects in this frame.
+  std::string labelPath;
+
+  // Where the extracted pedestrian/cyclist points are written.  These bypass
+  // the codec entirely; only the remainder is encoded.
+  std::string pedPlyPath;
+
+  // Detections scoring below this are ignored.  Ground truth labels carry no
+  // score and are always kept.
+  double detScoreThreshold;
 
   // Filename for saving recoloured point cloud (encoder).
   std::string postRecolorPath;
@@ -162,6 +188,9 @@ public:
 
   int compress(Stopwatch* clock);
   double getLastEncodeOnlyMs() const { return _lastEncodeOnlyMs; }
+  double getLastExtractMs() const { return _lastExtractMs; }
+  int getLastPedPoints() const { return _lastPedPoints; }
+  int getLastRestPoints() const { return _lastRestPoints; }
 
 protected:
   int compressOneFrame(Stopwatch* clock);
@@ -189,6 +218,9 @@ private:
   int preIPFrame;
   bool codedGOF;
   double _lastEncodeOnlyMs = -1.0;
+  double _lastExtractMs = -1.0;
+  int _lastPedPoints = -1;
+  int _lastRestPoints = -1;
 };
 
 //----------------------------------------------------------------------------
@@ -222,14 +254,79 @@ void convertFromGbr(
   const std::vector<AttributeDescription>& attrDescs, PCCPointSet3& cloud);
 
 //============================================================================
+//
+//  :: Pedestrian/cyclist extraction from raw Model Predictions
+//   type  x  y  z   dx  dy  dz  ry 
+//     0   1  2  3   4   5   6   7 
+//
+// (x, y, z) is the centre of the box and is expressed in
+// the velodyne frame.
+
+struct Detection {
+  std::string name;
+
+  // Box centre in the velodyne frame.
+  Vec3<double> centre;
+
+  // Extents along the box's own axes: (dx, dy, dz) == (l, w, h).
+  Vec3<double> size;
+
+  // Rotation about the velodyne z axis, derived from the camera frame ry.
+  double heading;
+
+  double score;
+};
+
+//----------------------------------------------------------------------------
+// A detection reduced to the form the point test needs, with positions scaled
+// into the same units as the cloud returned by ply::read.
+
+struct OrientedBox {
+  Vec3<double> centre;
+  Vec3<double> half;
+
+  // The test rotates points by -heading.
+  double cosT;
+  double sinT;
+
+  // Squared xy extent of the box, for a cheap early reject.
+  double xyRadiusSq;
+
+  bool contains(const point_t& p) const
+  {
+    double dx = double(p[0]) - centre[0];
+    double dy = double(p[1]) - centre[1];
+    if (dx * dx + dy * dy > xyRadiusSq)
+      return false;
+
+    double dz = double(p[2]) - centre[2];
+    if (std::abs(dz) > half[2])
+      return false;
+
+    double lx = dx * cosT + dy * sinT;
+    double ly = -dx * sinT + dy * cosT;
+    return std::abs(lx) <= half[0] && std::abs(ly) <= half[1];
+  }
+};
+
 
 int
 main(int argc, char* argv[])
 {
   cout << "MPEG PCC litelogs version " << ::pcc::version << endl;
-  const fs::path dataPath = "/home/dungrup/wd_black/litelogs/test_folder/orig_ply_files/";
-  const fs::path compressedPath = "/home/dungrup/wd_black/litelogs/test_folder/compressed/";
-  const fs::path csvPath = "/home/dungrup/wd_black/litelogs/litelogs_encoding_times.csv";
+  const fs::path dataPath = "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr/val_ply";
+  const fs::path compressedPath = "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/litelogs_l1";
+  const fs::path csvPath = "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/litelogs_l1/encoding_times.csv";
+  const fs::path detPath =
+    "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/lidar_raw_dets_val";
+  const fs::path pedPath = "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/litelogs_l1/ped_ply/";
+  const fs::path reconPath =
+    "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/litelogs_l1/rest_only_decoded_ply/";
+
+  // One file stem per line.  Only these frames are processed; the input
+  // directory is not enumerated.
+  const fs::path stemListPath =
+    "/home/dungrup/wd_black/litelogs/test_folder/val_peds.txt";
 
   Parameters baseParams;
 
@@ -245,8 +342,9 @@ main(int argc, char* argv[])
 
   try {
     fs::create_directories(compressedPath);
+    fs::create_directories(reconPath);
   } catch (const fs::filesystem_error& e) {
-    std::cerr << "Error creating output directory: " << compressedPath
+    std::cerr << "Error creating output directory: " << e.path1()
               << "\n  " << e.what() << std::endl;
     return 1;
   }
@@ -256,30 +354,58 @@ main(int argc, char* argv[])
     std::cerr << "Error opening CSV file for writing: " << csvPath << std::endl;
     return 1;
   }
-  csvFile << "input_ply,compressed_bin,encode_only_ms,status\n";
+  csvFile << "input_ply,compressed_bin,extract_ms,ped_points,rest_points,"
+             "encode_only_ms,status\n";
 
-  // Get only .ply files from the input directory.
+  // Take the work list from stemListPath, one stem per line.  Frames are
+  // processed in the order given: unlike directory_iterator, the file already
+  // fixes an order, so there is nothing to sort.
   std::vector<fs::path> filePaths;
-  try {
-    for (const auto& entry : fs::directory_iterator(dataPath)) {
-      if (!entry.is_regular_file())
-        continue;
-
-      const auto& path = entry.path();
-      if (path.extension() == ".ply")
-        filePaths.push_back(path);
+  std::vector<std::string> missingStems;
+  {
+    std::ifstream stemList(stemListPath);
+    if (!stemList.is_open()) {
+      std::cerr << "Error opening stem list: " << stemListPath << std::endl;
+      return 1;
     }
-  } catch (const fs::filesystem_error& e) {
-    std::cerr << "Error reading input directory: " << dataPath
-              << "\n  " << e.what() << std::endl;
+
+    std::string line;
+    while (std::getline(stemList, line)) {
+      // Tolerate CRLF and stray indentation.
+      const auto first = line.find_first_not_of(" \t\r\n");
+      if (first == std::string::npos)
+        continue;
+      const auto last = line.find_last_not_of(" \t\r\n");
+      const auto stem = line.substr(first, last - first + 1);
+
+      auto plyPath = dataPath / (stem + ".ply");
+      if (!fs::exists(plyPath)) {
+        missingStems.push_back(stem);
+        continue;
+      }
+
+      filePaths.push_back(std::move(plyPath));
+    }
+  }
+
+  if (!missingStems.empty()) {
+    std::cerr << "Warning: " << missingStems.size() << " of "
+              << (missingStems.size() + filePaths.size())
+              << " stems in " << stemListPath << " have no .ply in " << dataPath
+              << "; first few:";
+    for (size_t i = 0; i < missingStems.size() && i < 5; i++)
+      std::cerr << ' ' << missingStems[i];
+    std::cerr << std::endl;
+  }
+
+  if (filePaths.empty()) {
+    std::cerr << "Error: no .ply files listed in " << stemListPath
+              << " were found in " << dataPath << std::endl;
     return 1;
   }
 
-  std::sort(filePaths.begin(), filePaths.end());
-  if (filePaths.empty()) {
-    std::cerr << "Error: no .ply files found in " << dataPath << std::endl;
-    return 1;
-  }
+  std::cout << "Processing " << filePaths.size() << " frames listed in "
+            << stemListPath << std::endl;
 
   // Timers to count elapsed wall/user time
   pcc::chrono::Stopwatch<std::chrono::steady_clock> clock_wall;
@@ -294,25 +420,41 @@ main(int argc, char* argv[])
 
   std::vector<Failure> failures;
   size_t successCount = 0;
+  auto writeCsvField = [&](double value) {
+    if (value < 0)
+      csvFile << "NA";
+    else
+      csvFile << value;
+    csvFile << ',';
+  };
+
   auto writeCsvRow = [&](const std::string& inputPath,
                          const std::string& outputPath,
+                         const SequenceEncoder& enc,
                          double encodeOnlyMs,
                          const char* status) {
     csvFile << '"' << inputPath << '"' << ','
             << '"' << outputPath << '"' << ',';
-    if (encodeOnlyMs < 0)
-      csvFile << "NA";
-    else
-      csvFile << encodeOnlyMs;
-    csvFile << ',' << status << '\n';
+    writeCsvField(enc.getLastExtractMs());
+    writeCsvField(enc.getLastPedPoints());
+    writeCsvField(enc.getLastRestPoints());
+    writeCsvField(encodeOnlyMs);
+    csvFile << status << '\n';
   };
 
   // Iterate over each file and compress
   for (const auto& filePath : filePaths) {
+    const auto stem = filePath.stem().string();
+
     Parameters runParams = baseParams;
     runParams.uncompressedDataPath = filePath.string();
-    runParams.compressedStreamPath =
-      (compressedPath / (filePath.stem().string() + ".bin")).string();
+    runParams.compressedStreamPath = (compressedPath / (stem + ".bin")).string();
+
+    // Labels are matched to the ply by file stem rather than by directory
+    // ordering: not every frame necessarily carries a label file.
+    runParams.labelPath = (detPath / (stem + ".txt")).string();
+    runParams.pedPlyPath = (pedPath / stem / "ped.ply").string();
+
     runParams.firstFrameNum = 0;
     runParams.frameCount = 1;
 
@@ -327,24 +469,51 @@ main(int argc, char* argv[])
     int ret = sequenceEncoder.compress(&clock_user);
     double encodeOnlyMs = sequenceEncoder.getLastEncodeOnlyMs();
 
+    // Decode the bitstream straight back so the run also yields reconstructed
+    // plys.  NB: reconstructedDataPath is deliberately left unset during the
+    // encode above -- setting it would make the encoder emit its own
+    // reconstruction instead
+    int dret = 0;
+    if (!ret) {
+      runParams.reconstructedDataPath = (reconPath / (stem + ".ply")).string();
+      std::cout << "  recon: " << runParams.reconstructedDataPath << std::endl;
+      dret = SequenceDecoder(&runParams).decompress(&clock_user);
+    }
+
     auto perFileWallMs = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - fileStart).count();
-    std::cout << "Per-file processing time (wall): "
+    std::cout << "Per-file processing time "
+                 "(wall, includes decode and file write): "
               << perFileWallMs / 1000.0 << " s\n";
 
     if (ret != 0) {
       failures.push_back({fileName, "encoder returned " + std::to_string(ret)});
       writeCsvRow(
         runParams.uncompressedDataPath, runParams.compressedStreamPath,
-        encodeOnlyMs, "failed");
+        sequenceEncoder, encodeOnlyMs, "failed");
       std::cerr << "Error compressing file: " << fileName << std::endl;
+      continue;
+    }
+
+    if (dret != 0) {
+      failures.push_back({fileName, "decoder returned " + std::to_string(dret)});
+      writeCsvRow(
+        runParams.uncompressedDataPath, runParams.compressedStreamPath,
+        sequenceEncoder, encodeOnlyMs, "decode_failed");
+      std::cerr << "Error decoding file: " << runParams.compressedStreamPath
+                << std::endl;
       continue;
     }
 
     writeCsvRow(
       runParams.uncompressedDataPath, runParams.compressedStreamPath,
-      encodeOnlyMs, "ok");
+      sequenceEncoder, encodeOnlyMs, "ok");
     successCount++;
+
+    std::cout << "-----------------------------------------" << std::endl;
+
+    if (successCount == 200)
+      break;
   }
 
   clock_wall.stop();
@@ -355,12 +524,13 @@ main(int argc, char* argv[])
 
   std::cout << "Summary: total=" << filePaths.size()
             << ", succeeded=" << successCount
-            << ", failed=" << failures.size() << '\n';
+            << ", failed=" << failures.size()
+            << ", missing=" << missingStems.size() << '\n';
 
-  std::cout << "Total processing time (wall): " << total_wall / 1000.0
-            << " s\n";
-  std::cout << "Total processing time (user): " << total_user / 1000.0
-            << " s\n";
+  std::cout << "Total processing time (wall, encode + decode): "
+            << total_wall / 1000.0 << " s\n";
+  std::cout << "Total processing time (user, encode + decode): "
+            << total_user / 1000.0 << " s\n";
 
   if (!failures.empty()) {
     std::cerr << "Failed files:\n";
@@ -775,6 +945,11 @@ ParseParameters(int argc, char* argv[], Parameters& params)
   ("compressedStreamPath",
     params.compressedStreamPath, {},
     "The compressed bitstream path (encoder=output, decoder=input)")
+
+  ("detScoreThreshold",
+    params.detScoreThreshold, 0.,
+    "Ignore pedestrian/cyclist detections scoring below this.  Ground truth "
+    "labels carry no score and are always kept")
 
   ("postRecolorPath",
     params.postRecolorPath, {},
@@ -2268,6 +2443,9 @@ int
 SequenceEncoder::compress(Stopwatch* clock)
 {
   _lastEncodeOnlyMs = -1.0;
+  _lastExtractMs = -1.0;
+  _lastPedPoints = -1;
+  _lastRestPoints = -1;
 
   bytestreamFile.open(params->compressedStreamPath, ios::binary);
   if (!bytestreamFile.is_open()) {
@@ -2298,6 +2476,130 @@ SequenceEncoder::compress(Stopwatch* clock)
 
 //----------------------------------------------------------------------------
 
+static bool
+isPedestrian(const std::string& name)
+{
+  std::string lower = name;
+  std::transform(
+    lower.begin(), lower.end(), lower.begin(),
+    [](unsigned char c) { return std::tolower(c); });
+
+  return !lower.compare(0, 3, "ped") || !lower.compare(0, 4, "cycl");
+}
+
+//----------------------------------------------------------------------------
+// Read the pedestrian/cyclist boxes for one frame, ALREADY IN
+// velodyne frame.  A missing label file is not an error: the frame simply has
+// no annotated objects and every point is treated as background.
+
+static std::vector<Detection>
+readDetections(
+  const std::string& fileName,
+  double scoreThreshold)
+{
+  std::vector<Detection> detections;
+
+  std::ifstream file(fileName);
+  if (!file.is_open())
+    return detections;
+
+  std::string line;
+  while (std::getline(file, line)) {
+    std::istringstream iss(line);
+
+    std::string type;
+    double x, y, z, w, h, l, ry;
+
+    // NB: eval_lidar_only.py writes `class x y z w h l ry` -- it emits
+    // box[4], box[5], box[3], so the trio is (w, h, l) and NOT (dx, dy, dz).
+    // Blank and malformed lines are skipped rather than aborting the frame.
+    if (!(iss >> type >> x >> y >> z >> w >> h >> l >> ry))
+      continue;
+
+    // Ground truth labels stop at ry; detector output appends a score.
+    // NB: a failed extraction zeroes its operand, so the value is only taken
+    // when the read actually succeeded.
+    double score = 1.;
+    double parsedScore;
+    if (iss >> parsedScore)
+      score = parsedScore;
+
+    if (!isPedestrian(type) || score < scoreThreshold)
+      continue;
+
+    Detection det;
+    det.name = type;
+    det.centre = Vec3<double>(x, y, z);
+    det.size = Vec3<double>(l, w, h);
+    det.heading = ry;
+    det.score = score;
+    detections.push_back(det);
+  }
+
+  return detections;
+}
+
+//----------------------------------------------------------------------------
+
+static std::vector<OrientedBox>
+makeBoxes(const std::vector<Detection>& detections, double inputScale)
+{
+  std::vector<OrientedBox> boxes;
+  boxes.reserve(detections.size());
+
+  for (const auto& det : detections) {
+    OrientedBox box;
+    box.centre = det.centre * inputScale;
+    box.half = det.size * (inputScale / 2);
+    box.cosT = std::cos(det.heading);
+    box.sinT = std::sin(det.heading);
+    box.xyRadiusSq = box.half[0] * box.half[0] + box.half[1] * box.half[1];
+    boxes.push_back(box);
+  }
+
+  return boxes;
+}
+
+//----------------------------------------------------------------------------
+// Partition src into the points falling inside any of @boxes and the rest.
+// Returns the number of extracted points.
+
+static int
+splitPedestrianPoints(
+  const PCCPointSet3& src,
+  const std::vector<OrientedBox>& boxes,
+  PCCPointSet3* ped,
+  PCCPointSet3* rest)
+{
+  const int pointCount = int(src.getPointCount());
+
+  std::vector<int32_t> pedIdx;
+  std::vector<int32_t> restIdx;
+  restIdx.reserve(pointCount);
+
+  for (int i = 0; i < pointCount; i++) {
+    bool inside = false;
+    for (const auto& box : boxes) {
+      if (box.contains(src[i])) {
+        inside = true;
+        break;
+      }
+    }
+
+    if (inside)
+      pedIdx.push_back(i);
+    else
+      restIdx.push_back(i);
+  }
+
+  *ped = getPartition(src, pedIdx);
+  *rest = getPartition(src, restIdx);
+
+  return int(pedIdx.size());
+}
+
+//----------------------------------------------------------------------------
+
 int
 SequenceEncoder::compressOneFrame(Stopwatch* clock)
 {
@@ -2312,6 +2614,49 @@ SequenceEncoder::compressOneFrame(Stopwatch* clock)
     cout << "Error: can't open input file!" << endl;
     return -1;
   }
+
+  // Route pedestrian/cyclist points around the codec: they are written out
+  // verbatim and only the remainder is handed to the encoder.  Frames with no
+  // label file, or whose labels hold no pedestrians, are encoded whole.
+  _lastPedPoints = 0;
+  if (!params->labelPath.empty() && fs::exists(params->labelPath)) {
+    const auto extractStart = std::chrono::steady_clock::now();
+
+    auto boxes = makeBoxes(
+      readDetections(params->labelPath, params->detScoreThreshold),
+      params->inputScale);
+
+    PCCPointSet3 pedCloud;
+    if (!boxes.empty()) {
+      PCCPointSet3 restCloud;
+      _lastPedPoints =
+        splitPedestrianPoints(pointCloud, boxes, &pedCloud, &restCloud);
+      pointCloud.swap(restCloud);
+    }
+
+    _lastExtractMs = std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - extractStart)
+                       .count();
+
+    if (_lastPedPoints && !params->pedPlyPath.empty()) {
+      const auto pedDir = fs::path(params->pedPlyPath).parent_path();
+      if (!pedDir.empty())
+        fs::create_directories(pedDir);
+
+      if (!ply::write(
+            pedCloud, _plyAttrNames, 1. / params->inputScale, Vec3<double>(0.),
+            params->pedPlyPath, !params->outputBinaryPly)) {
+        cout << "Error: can't write extracted ped ply!" << endl;
+        return -1;
+      }
+    }
+
+    if (!pointCloud.getPointCount()) {
+      cout << "Error: extraction consumed every point!" << endl;
+      return -1;
+    }
+  }
+  _lastRestPoints = int(pointCloud.getPointCount());
   // Some evaluations wish to scan the points in azimuth order to simulate
   // real-time acquisition (since the input has lost its original order).
   // NB: because this is trying to emulate the input order, binning is disabled
