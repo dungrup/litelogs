@@ -864,9 +864,9 @@ PCCTMC3Encoder3::compress(
   }
 
   gettimeofday(&frame_time.end, NULL);
-  double elapsedTime = (frame_time.end.tv_sec - frame_time.start.tv_sec)*1000.0;
-  elapsedTime += (frame_time.end.tv_usec - frame_time.start.tv_usec) / 1000.0;
-  _lastTileEncodingMs = elapsedTime;
+  double elapsedTime_frame = (frame_time.end.tv_sec - frame_time.start.tv_sec)*1000.0;
+  elapsedTime_frame += (frame_time.end.tv_usec - frame_time.start.tv_usec) / 1000.0;
+  _lastTileEncodingMs = elapsedTime_frame;
 
   const PCCPointSet3 accurrentPointCloud =(reconCloud) ? reconCloud->cloud : PCCPointSet3{};
   if (_sps->inter_frame_prediction_enabled_flag) {

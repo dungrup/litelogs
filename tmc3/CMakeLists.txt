@@ -193,5 +193,14 @@ add_executable (ply-merge EXCLUDE_FROM_ALL
 )
 add_dependencies(ply-merge genversion)
 
+add_executable (ply-cat
+  "../tools/ply-cat.cpp"
+  "misc.cpp"
+  "ply.cpp"
+  "../dependencies/program-options-lite/program_options_lite.cpp"
+  ${VERSION_FILE}
+)
+add_dependencies(ply-cat genversion)
+
 install (TARGETS tmc3 DESTINATION bin)
 install (TARGETS litelogs DESTINATION bin)

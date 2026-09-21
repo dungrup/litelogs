@@ -12,10 +12,21 @@
 
 ```
 > mkdir build
-> cd build
-> cmake .. 
-> make
+> cmake -B ./build/ -DCMAKE_BUILD_TYPE=Release 
+> cmake --build ./build -j$(nproc)
 ```
+
+This builds all three binaries. To rebuild just one:
+
+```
+> cmake --build ./build --target ply-cat
+```
+
+`ply-cat` links only the ply reader/writer and the option parser — no codec
+objects — so it rebuilds in a few seconds.
+
+Use `-DCMAKE_BUILD_TYPE=Release` for any run you intend to take timings from;
+Debug numbers are not meaningful.
 
 ### Windows
 - md build
@@ -26,19 +37,57 @@
 
 ## Running
 
-**UPDATE:** LiteLogs is an encoder only implementation of TMC13 with tile-level and slice-level multithreading enabled. You can find the "litelogs" binary alongside the TMC13 binary in "./build/tmc3/"
+**UPDATE:** the build produces three binaries in `./build/tmc3/`:
 
-To run litelogs:
+| binary | role |
+|---|---|
+| `tmc3` | stock TMC13 encoder + decoder |
+| `litelogs` | batch tool: extract peds, encode the rest, decode it straight back |
+| `ply-cat` | merge the extracted ped cloud back onto the decoded remainder |
 
-1. Point to correct paths in LiteLogs.cpp (L230-232)
+`litelogs` adds tile-level and slice-level multithreading to the encode path.
+It is no longer encoder-only — after each successful encode it decodes the
+bitstream back in-process and writes the reconstructed `.ply`.
+
+### litelogs
+
+1. Point to correct paths in `LiteLogs.cpp` (L317-329) — they are hardcoded
+   constants, not command line options
 2. Re-build using above instructions
-3. Litelogs will compress all files in __dataPath__ to __compressedPath__. Find timing stats in __csvPath__
+3. The frames to process are read from __stemListPath__ (one file stem per
+   line, processed in the order written), *not* by scanning __dataPath__
+4. For each frame, litelogs writes the ped cloud to __pedPath__, the bitstream
+   to __compressedPath__ and the decoded remainder to __reconPath__. Timing
+   stats land in __csvPath__
 
 ```
-> ./build/tmc3/litelogs -c encoder_fast.cfg
+> ./build/tmc3/litelogs -c encoder_fast_l3.cfg
 ```
 
-Tune necessary params in __encoder_fast.cfg__
+Tune necessary params in __encoder_fast_l1.cfg__ / __encoder_fast_l3.cfg__ —
+the two files are one rate point apart, differing only in
+`positionQuantizationScale` and `tileSize`.
+
+### ply-cat
+
+`litelogs` keeps the ped cloud and the decoded remainder in separate files.
+`ply-cat` joins them into one `.ply` per frame. Every path is an option here,
+and `--stemList` takes the same work list, so both tools walk the same frames:
+
+```
+> ./build/tmc3/ply-cat \
+    --reconDir=<reconPath> \
+    --pedDir=<pedPath> \
+    --outDir=<merged output dir> \
+    --stemList=test_folder/val_peds.txt \
+    --csvPath=<merge summary csv>
+```
+
+Options must be given as `--opt=value`; a space-separated value is silently
+ignored. Frames whose detections held no pedestrians have no `ped.ply` at all
+and simply pass through. `--positionScale` (default 1000) is the scale applied
+on read before truncation to integers and inverted on write — leaving it at
+1000 matches `inputScale` and preserves the ped cloud's millimetre precision.
 
 
 This TMC13 codec implementation encodes frame sequences.  A single binary

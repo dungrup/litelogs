@@ -11,6 +11,9 @@ release-v23.0-rc2) called **LiteLogs**. The fork adds:
    frames: it extracts pedestrian/cyclist points out of each cloud, encodes
    only the remainder, decodes the bitstream straight back, and writes
    per-frame timings to CSV (`tmc3/LiteLogs.cpp`).
+3. A **third binary** (`ply-cat`) that concatenates the extracted ped cloud
+   back onto the decoded remainder, one merged `.ply` per frame
+   (`tools/ply-cat.cpp`).
 
 Everything else is stock TMC13 — do not treat unmodified upstream files as
 fork code. To see exactly what this fork owns:
@@ -21,10 +24,14 @@ git diff --stat a3d15c5..HEAD
 
 Files that diverge from upstream: `CMakeLists.txt`, `tmc3/CMakeLists.txt`,
 `tmc3/encoder.cpp`, `tmc3/PCCTMC3Encoder.h`, `tmc3/LiteLogs.cpp` (new),
-`decode.sh` (new), `encoder_fast_l1.cfg` / `encoder_fast_l3.cfg` (new),
-`run_configs.sh` (new), `README.md`, `.gitignore`. The older single
+`tools/ply-cat.cpp` (new), `decode.sh` (new), `encoder_fast_l1.cfg` /
+`encoder_fast_l3.cfg` (new), `README.md`, `.gitignore`. The older single
 `encoder_fast.cfg` has been **deleted** in favour of the two `_l1` / `_l3`
 rate points.
+
+`tools/ply-merge.cpp` is **upstream**, not fork code — don't confuse it with
+`ply-cat`. Its "merge" means grouping N frames into one cloud tagged by
+`frameindex`, which is a different operation entirely.
 
 ## Building
 
@@ -32,16 +39,29 @@ rate points.
 mkdir -p build && cd build && cmake .. && make
 ```
 
-Produces two binaries in `build/tmc3/`: `tmc3` (stock encoder+decoder) and
-`litelogs` (batch tool). Both link `Threads::Threads`.
+Produces three binaries in `build/tmc3/`:
+
+| binary | what it is | links |
+|---|---|---|
+| `tmc3` | stock encoder+decoder | all codec objects, `Threads::Threads` |
+| `litelogs` | batch extract/encode/decode tool | all codec objects, `Threads::Threads` |
+| `ply-cat` | ped + rest merge tool | `ply.cpp`, `misc.cpp`, `program_options_lite.cpp`, `version.cpp` |
+
+All three are in the default `all` target, so a plain `make` builds them.
+To build just one: `cmake --build build --target ply-cat`.
+
+`ply-cat` deliberately links **no codec objects** — it only needs the ply
+reader/writer and `PCCPointSet3` (header-only). Keep it that way: it is a
+~5-second build, which is the point of having it separate from `litelogs`.
+`ply-merge` (upstream) has the same link set but is `EXCLUDE_FROM_ALL`.
 
 - The fork bumped the standard from **C++11 to C++17** in the top-level
   `CMakeLists.txt` — `LiteLogs.cpp` needs `<filesystem>`. Don't revert this.
 - `tmc3/CMakeLists.txt` moved `TMC3.cpp` out of the shared `PROJECT_CPP_FILES`
   glob into a new `PROJECT_COMMON_FILES` set, so `tmc3` and `litelogs` share
   all objects but each get their own `main()`. Add new shared sources to
-  `PROJECT_CPP_FILES`; never add `TMC3.cpp` or `LiteLogs.cpp` there (duplicate
-  `main`).
+  `PROJECT_CPP_FILES`; never add `TMC3.cpp`, `LiteLogs.cpp` or `ply-cat.cpp`
+  there (duplicate `main`).
 - The existing `build/` cache is configured `CMAKE_BUILD_TYPE=Debug` with
   clang++-14. For timing measurements, reconfigure with
   `-DCMAKE_BUILD_TYPE=Release` — Debug numbers are not meaningful.
@@ -57,15 +77,19 @@ Produces two binaries in `build/tmc3/`: `tmc3` (stock encoder+decoder) and
 **All paths are hardcoded** in `tmc3/LiteLogs.cpp:317-329` and must be edited +
 rebuilt to point elsewhere. They are NOT command-line options:
 
+Paths below are relative to `samsung_evo/LiteLogs/`; `ICRA` abbreviates
+`KITTI_Attr_ICRA/litelogs_l3`. **They name an `_l3` output tree, so switching
+rate point means editing them** — nothing derives the directory from the cfg.
+
 | constant | current value | role |
 |---|---|---|
-| `dataPath` | `samsung_evo/LiteLogs/KITTI_Attr/val_ply` | input `.ply` frames |
-| `detPath` | `samsung_evo/LiteLogs/KITTI_Attr/lidar_raw_dets_val` | per-frame detections |
-| `stemListPath` | `test_folder/val_peds.txt` | which frames to process |
-| `compressedPath` | `test_folder/compressed_slicing_new_lite/` | `<stem>.bin` |
-| `reconPath` | `test_folder/recon_ply/` | decoded `<stem>.ply` |
-| `pedPath` | `test_folder/ped/` | `<stem>/ped.ply` |
-| `csvPath` | `test_folder/slicing_encoding_times_new_lite.csv` | results |
+| `dataPath` | `KITTI_Attr/val_ply` | input `.ply` frames |
+| `detPath` | `KITTI_Attr_ICRA/lidar_raw_dets_val` | per-frame detections |
+| `stemListPath` | `<repo>/test_folder/val_peds.txt` | which frames to process |
+| `compressedPath` | `ICRA/rest_only_compressed_bin` | `<stem>.bin` |
+| `reconPath` | `ICRA/rest_only_decoded_ply/` | decoded `<stem>.ply` |
+| `pedPath` | `ICRA/ped_ply/` | `<stem>/ped.ply` |
+| `csvPath` | `ICRA/encoding_times.csv` | results |
 
 `litelogs` ignores `uncompressedDataPath`/`compressedStreamPath` from the cfg
 and overrides them per file; it also forces `firstFrameNum=0`, `frameCount=1`
@@ -91,9 +115,10 @@ input_ply,compressed_bin,extract_ms,ped_points,rest_points,encode_only_ms,status
 `biPredictionEnabledFlag` causes an immediate error exit, and `compressOneGOF`
 / `setMotionVectorFileName` are stripped from `SequenceEncoder::compress`.
 
-- **`if (successCount == 200) break;`** near the end of the per-file loop
-  (`LiteLogs.cpp:515`) is a debug cap. It silently truncates any run to 200
-  frames — `val_peds.txt` has 1291 stems. Remove it for real runs.
+- A debug cap, `if (successCount == 200) break;`, sits **commented out** at
+  `LiteLogs.cpp:515-516`. Left in place on purpose for quick 200-frame smoke
+  runs; uncomment it and every run silently truncates to 200 of the 1291
+  stems in `val_peds.txt`. Check it before trusting a short run.
 
 ### Configs
 
@@ -117,23 +142,62 @@ trip `assert(codeReflectance == pointCloud.hasReflectances())`.
 `outputBinaryPly: 0` means ASCII recon output, roughly **3 MB per frame**.
 Set it to `1` unless you need text.
 
-### `run_configs.sh`
+### `ply-cat` (merge ped + decoded rest)
 
 ```
-./run_configs.sh                       # encoder_fast_l1.cfg then _l3.cfg
-./run_configs.sh some_other.cfg
+./build/tmc3/ply-cat \
+  --reconDir=<ICRA>/rest_only_decoded_ply \
+  --pedDir=<ICRA>/ped_ply \
+  --outDir=<ICRA>/merged_ply \
+  --stemList=test_folder/val_peds.txt \
+  --csvPath=<ICRA>/merge_summary.csv
 ```
 
-Because the output paths are hardcoded and the CSV is opened `std::ios::trunc`,
-consecutive configs would overwrite each other. The script therefore **moves**
-each run's outputs into `test_folder/runs/<config stem>/` (along with a copy of
-the `.cfg` and a `run.log`) before starting the next. Pre-existing output found
-on the first run is stashed to `test_folder/runs/_prior_<timestamp>/` rather
-than deleted. A config that exits nonzero still gets its partial output
-archived; the script reports it and exits 1 at the end.
+Unlike `litelogs`, nothing is hardcoded — every path is an option, and
+`--stemList` takes the same `val_peds.txt` so both tools walk the same frames
+in the same order. Options are `--opt=value` only (see below).
 
-Output-path variables at the top of the script **must track the hardcoded paths
-in `LiteLogs.cpp`** — they are duplicated, not derived.
+| option | default | role |
+|---|---|---|
+| `reconDir` | — | decoded remainder, `<stem>.ply` |
+| `pedDir` | — | extracted peds, `<stem>/ped.ply` |
+| `outDir` | — | merged `<stem>.ply` (created if absent) |
+| `stemList` | — | work list, one stem per line |
+| `csvPath` | unset | optional per-frame summary |
+| `positionScale` | `1000.` | read scale, inverted on write |
+| `outputBinaryPly` | `true` | binary vs ascii output |
+
+CSV columns: `stem,recon_points,ped_points,total_points,status`, where `status`
+is `ok`, `ok_no_ped`, `recon_failed`, `ped_failed`, `attr_mismatch` or
+`write_failed`. A frame fails without aborting the batch; the exit code is 1
+if any frame failed.
+
+Three things that are easy to get wrong here:
+
+- **`positionScale` is load-bearing.** `ply::read` multiplies by it and
+  truncates into `Vec3<int32_t>` (`ply.cpp:407-409`, `PCCPointSet.h:60`), so
+  the default of `1.0` used by `ply-merge` would collapse every point to
+  integer **metres**. 1000 matches `inputScale` and keeps the ped cloud's
+  millimetre precision exactly. The recon lattice is
+  `1/(inputScale × positionQuantizationScale)` = 133.3 mm at `_l3`, which is
+  not a whole number of mm, so recon points shift by **≤0.67 mm** on the
+  round-trip — measured, and ~200× below the quantization step.
+- **A missing `ped.ply` is normal.** `compressOneFrame` only writes one when
+  `_lastPedPoints` is nonzero; in the 1291-frame `_l3` run, 9 frames have none.
+  Those pass through as `ok_no_ped`, not an error.
+- **Attribute parity is checked before the append**, because
+  `PCCPointSet3::append` guards each copy on `hasX() && src.hasX()` and
+  silently leaves the rest uninitialised. A mismatch is refused outright rather
+  than written out.
+
+`ply::write` always emits `property uint16 refc` regardless of the
+`PropertyNameMap` (`ply.cpp:132`) — only positions are named by it — and
+`ply::read` accepts `reflectance` or `refc` (`ply.cpp:349`), so the round-trip
+closes. In binary mode positions are written as `float64`, in ascii as `float`.
+
+Note `litelogs_eval.py` also concatenates these two clouds in
+`run_class_separated_compression`. Decide which one owns the merge rather than
+letting both drift.
 
 ### Standalone decoding
 
@@ -200,9 +264,11 @@ camera-frame `label_2` convention and would be double-applied here.
 
 ### Geometry of the test
 
-`OrientedBox::half` holds half-extents in **millimetres** (`det.size *
-inputScale / 2`), matching `ply::read`, which multiplies by `inputScale` and
-truncates into `Vec3<int32_t>`. `contains` tests, in order: a squared
+`OrientedBox::half` holds **inflated** half-extents in **millimetres**
+(`det.size * inputScale * inflation / 2`), matching `ply::read`, which
+multiplies by `inputScale` and truncates into `Vec3<int32_t>`. `Detection::size`
+keeps the detector's true extents — the inflation lives only in the box, so
+anything reporting box dimensions still sees real ones. `contains` tests, in order: a squared
 xy-circumradius early reject (`xyRadiusSq = half[0]² + half[1]²`, valid because
 rotation preserves length), the axis-aligned z slab (`half[2]`), then the exact
 half-extent compare after rotating by `-heading`.
@@ -216,6 +282,27 @@ ranging noise.
 A failed `operator>>` zeroes its operand, so the optional score is parsed into
 a scratch variable and only committed on success — otherwise score-less labels
 would read as 0 and be filtered out.
+
+`detBoxInflation` (cfg option, default `1.`) scales the box extents about their
+centre before the point test, pulling in more points. It is applied in
+`makeBoxes` — deliberately not in `readDetections` (which stays a pure parser
+of that error-prone column order) and not in `contains` (see below). Values
+`<= 0` are rejected in `ParseParameters`: they would collapse or invert every
+box and silently extract nothing rather than fail visibly.
+
+Note `box.xyRadiusSq` is computed **from** `box.half`, so the early reject grows
+with the box automatically. Preserve that assignment order: deriving the radius
+before applying inflation would leave the reject cutting at the original
+circumradius, and extraction counts would climb a little and then stop
+responding to the factor.
+
+Two behaviours to expect when raising it. A pedestrian box is roughly
+0.6 × 0.6 × 1.8 m, so a uniform factor adds three times as much vertically as
+laterally, and half of that vertical growth goes **downward into the ground
+plane** — extra points skew towards ground return, not person. And the union
+of `ped.ply` and the coded cloud is invariant, so `ply-cat`'s `total_points`
+column should be identical at every inflation setting; that makes a good
+end-to-end check.
 
 ## The decode pass
 
@@ -231,12 +318,17 @@ reconstruction *and* pull the per-tile recon merge (`encoder.cpp:851-864`)
 inside the window that `getLastEncodeOnlyMs()` measures. Don't "tidy" this by
 hoisting the assignment.
 
-The ped cloud is **not** merged back in — `ped.ply` and the decoded rest stay
-separate, and `litelogs_eval.py` concatenates them
-(`run_class_separated_compression`). Merging in C++ would need the ped cloud
-mapped from input-mm into the recon's coding coords via `outputScale` /
-`outputOrigin`, plus an attribute-parity check (`PCCPointSet3::append` silently
-leaves attributes uninitialised on mismatch).
+The ped cloud is **not** merged back in here — `ped.ply` and the decoded rest
+stay separate, and `ply-cat` (or `litelogs_eval.py`) joins them afterwards.
+
+Merging *inside* `LiteLogs.cpp` is the hard version, and that is why it is not
+done: the recon cloud is still in integer coding coords at that point, so the
+ped cloud would need mapping from input-mm through `outputScale` /
+`outputOrigin`. **`ply-cat` faces no such problem** — by the time both clouds
+are files, `writeOutputFrame` and `ply::write` have already applied those
+scales, so the two are in the same external system (metres, velodyne) and a
+plain `append` is correct. Verified on frame `000001`: ped x ∈ [11.35, 11.82]
+sits inside recon x ∈ [-79.47, 77.07], against source x ∈ [-79.43, 77.01].
 
 Note the decoder is **entirely serial** — `tmc3/encoder.cpp` is the only file in
 the tree that uses threads, and the tile inventory is stored as metadata and
@@ -301,37 +393,56 @@ output. Leave them commented; uncomment locally for debugging only. (The
 decoder's copies are still live — see above.)
 
 Real timing comes from `_lastTileEncodingMs` on `PCCTMC3Encoder3`
-(getter `getLastTileEncodingMs()`), measured with `gettimeofday` around the
-tile worker join — there's an explicit comment that `chrono` was distrusted here.
-`SequenceEncoder::compressOneFrame` copies it into `_lastEncodeOnlyMs`, which
-becomes the `encode_only_ms` CSV column. Alongside it, `_lastExtractMs`,
-`_lastPedPoints` and `_lastRestPoints` feed the `extract_ms`, `ped_points` and
-`rest_points` columns; all four reset at the top of `SequenceEncoder::compress`.
+(getter `getLastTileEncodingMs()`), measured with `gettimeofday` — there's an
+explicit comment that `chrono` was distrusted here.
+`SequenceEncoder::compressOneFrame` copies it into `_lastEncodeOnlyMs`
+(`LiteLogs.cpp:2702`), which becomes the `encode_only_ms` CSV column. Alongside
+it, `_lastExtractMs`, `_lastPedPoints` and `_lastRestPoints` feed the
+`extract_ms`, `ped_points` and `rest_points` columns; all four reset at the top
+of `SequenceEncoder::compress`.
 
-`encode_only_ms` covers the encode alone. The run summary's **"Total processing
-time (wall/user, encode + decode)"** shares one `clock_user` across both passes,
-so those totals include decode; the per-file wall line does too. There is no
-per-frame decode column — add one if you need the split.
+**`_lastTileEncodingMs` is assigned unconditionally, on both encode paths.**
+The `frame_time` stopwatch starts at `encoder.cpp:347-348` and stops at
+`866-869` — four lines *after* the `if (!canThreadTiles) … } else { … }` branch
+closes at 864 — so the serial path is timed exactly like the threaded one. The
+only `return`s in that span (686, 690, 763, 767, 776, 827) are inside the
+worker lambdas and return from the lambda, not from `compress`. A CSV row
+reads `NA` only if `compress` throws.
 
-**Gotcha:** `_lastTileEncodingMs` is reset to `-1.0` at the top of `compress`
-and only assigned inside the threaded branch. If `canThreadTiles` is false
-(e.g. `tileSize` too large to yield >1 tile), every CSV row reads `NA` for
-timing even though encoding succeeded. If a run produces all-`NA` timings,
-check the tile count and the guard conditions first. Note that extraction
-shrinks the cloud and can therefore change the tile count — the `rest_points`
-column makes that diagnosable.
+There is a *second*, older stopwatch, `tile_time`, at `encoder.cpp:843-846`.
+That one **is** inside the threaded branch, and it now feeds nothing but the
+commented-out `"Tile encoding took"` print. Don't mistake it for the value that
+reaches the CSV. (Earlier revisions did assign `_lastTileEncodingMs` from it,
+which is why "timings go `NA` when `canThreadTiles` is false" was true once and
+is not any more.)
+
+Know what `frame_time` actually spans, because it is wider than "encode only":
+`quantization()`, the SPS/GPS/APS parameter-set writes, tile and slice
+partitioning, all slice encoding, and the per-tile recon merge. The run
+summary's **"Total processing time (wall/user, encode + decode)"** shares one
+`clock_user` across both passes, so those totals include decode; the per-file
+wall line does too. There is no per-frame decode column — add one if you need
+the split.
+
+Extraction shrinks the coded cloud and can therefore change the tile count. If
+it drops below 2, `canThreadTiles` goes false and the frame encodes serially —
+that shows up as a **slower** `encode_only_ms`, never as `NA`. The
+`rest_points` column makes it diagnosable.
 
 ## Conventions
 
 - Match upstream TMC13 style: 2-space indent, 80-column, `.clang-format` at the
   repo root. Fork additions follow it.
 - Files under `tmc3/` other than the ones listed above are upstream; prefer
-  making changes in `encoder.cpp` / `LiteLogs.cpp` so the fork delta stays small
-  and rebasable onto newer TMC13 releases.
+  making changes in `encoder.cpp` / `LiteLogs.cpp` / `tools/ply-cat.cpp` so the
+  fork delta stays small and rebasable onto newer TMC13 releases.
+- `.clang-format` is enforced by eye, not CI, but the binary on PATH may be a
+  broken pip shim — use `/usr/bin/clang-format-18` explicitly.
 - `test_folder/` is gitignored scratch space: `val_peds.txt` (the 1291-stem work
-  list), compressed/recon/ped output, result CSVs, `runs/` archives from
-  `run_configs.sh`, and `extract_ped_sample/` (reference output from
-  `extract_ped_plys.py`, useful for validating the extraction).
+  list, still read by both `litelogs` and `ply-cat`), older compressed/recon/ped
+  output, result CSVs, and `extract_ped_sample/` (reference output from
+  `extract_ped_plys.py`, useful for validating the extraction). Current runs
+  write to `samsung_evo/LiteLogs/KITTI_Attr_ICRA/` instead.
 - Reference implementations live outside this repo, under
   `/home/dungrup/wd_black/OpenPCDet/tools/`: `eval_lidar_only.py` (writes the
   detections), `extract_ped_plys.py` (the Python extraction this port must

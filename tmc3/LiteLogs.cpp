@@ -128,6 +128,10 @@ struct Parameters {
   // score and are always kept.
   double detScoreThreshold;
 
+  // Multiplier applied to the detection box extents before the point test.
+  // 1 leaves the boxes exactly as the detector reported them.
+  double detBoxInflation;
+
   // Filename for saving recoloured point cloud (encoder).
   std::string postRecolorPath;
 
@@ -315,13 +319,13 @@ main(int argc, char* argv[])
 {
   cout << "MPEG PCC litelogs version " << ::pcc::version << endl;
   const fs::path dataPath = "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr/val_ply";
-  const fs::path compressedPath = "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/litelogs_l1";
-  const fs::path csvPath = "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/litelogs_l1/encoding_times.csv";
+  const fs::path compressedPath = "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/bev_expt/litelogs_l3/rest_only_compressed_bin";
+  const fs::path csvPath = "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/bev_expt/litelogs_l3/encoding_times.csv";
   const fs::path detPath =
-    "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/lidar_raw_dets_val";
-  const fs::path pedPath = "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/litelogs_l1/ped_ply/";
+    "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/bev_expt/litelogs_regions/thr0.1/proposals_txt";
+  const fs::path pedPath = "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/bev_expt/litelogs_l3/ped_ply/";
   const fs::path reconPath =
-    "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/litelogs_l1/rest_only_decoded_ply/";
+    "/home/dungrup/samsung_evo/LiteLogs/KITTI_Attr_ICRA/bev_expt/litelogs_l3/rest_only_decoded_ply/";
 
   // One file stem per line.  Only these frames are processed; the input
   // directory is not enumerated.
@@ -512,8 +516,8 @@ main(int argc, char* argv[])
 
     std::cout << "-----------------------------------------" << std::endl;
 
-    if (successCount == 200)
-      break;
+    // if (successCount == 200)
+    //   break;
   }
 
   clock_wall.stop();
@@ -950,6 +954,12 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     params.detScoreThreshold, 0.,
     "Ignore pedestrian/cyclist detections scoring below this.  Ground truth "
     "labels carry no score and are always kept")
+
+  ("detBoxInflation",
+    params.detBoxInflation, 1.,
+    "Scale the pedestrian/cyclist box extents by this factor before testing "
+    "which points fall inside.  1 uses the boxes as reported; >1 grows them "
+    "about their centre, pulling in more points")
 
   ("postRecolorPath",
     params.postRecolorPath, {},
@@ -1873,6 +1883,11 @@ ParseParameters(int argc, char* argv[], Parameters& params)
   if (params.isDecoder && params.reconstructedDataPath.empty())
     err.error() << "reconstructedDataPath not set\n";
 
+  // A non-positive factor collapses or inverts every box, which would extract
+  // nothing at all rather than fail visibly.
+  if (params.detBoxInflation <= 0.)
+    err.error() << "detBoxInflation must be positive\n";
+
   // if (params.compressedStreamPath.empty())
   //   err.error() << "compressedStreamPath not set\n";
 
@@ -2527,6 +2542,9 @@ readDetections(
     if (!isPedestrian(type) || score < scoreThreshold)
       continue;
 
+    // if (score < scoreThreshold)
+    //   continue;
+
     Detection det;
     det.name = type;
     det.centre = Vec3<double>(x, y, z);
@@ -2542,7 +2560,10 @@ readDetections(
 //----------------------------------------------------------------------------
 
 static std::vector<OrientedBox>
-makeBoxes(const std::vector<Detection>& detections, double inputScale)
+makeBoxes(
+  const std::vector<Detection>& detections,
+  double inputScale,
+  double inflation = 1.)
 {
   std::vector<OrientedBox> boxes;
   boxes.reserve(detections.size());
@@ -2550,7 +2571,10 @@ makeBoxes(const std::vector<Detection>& detections, double inputScale)
   for (const auto& det : detections) {
     OrientedBox box;
     box.centre = det.centre * inputScale;
-    box.half = det.size * (inputScale / 2);
+
+    // NB: xyRadiusSq below is derived from the inflated half-extents, so the
+    // early reject in contains() grows with the box.  Keep that order.
+    box.half = det.size * (inputScale * inflation / 2);
     box.cosT = std::cos(det.heading);
     box.sinT = std::sin(det.heading);
     box.xyRadiusSq = box.half[0] * box.half[0] + box.half[1] * box.half[1];
@@ -2624,7 +2648,7 @@ SequenceEncoder::compressOneFrame(Stopwatch* clock)
 
     auto boxes = makeBoxes(
       readDetections(params->labelPath, params->detScoreThreshold),
-      params->inputScale);
+      params->inputScale, params->detBoxInflation);
 
     PCCPointSet3 pedCloud;
     if (!boxes.empty()) {
